@@ -24,11 +24,19 @@
 (define-constant ERR_CAMPAIGN_FULL (err u111))
 (define-constant ERR_QR_NOT_IN_CAMPAIGN (err u112))
 (define-constant ERR_INVALID_CAMPAIGN_PARAMS (err u113))
+(define-constant ERR_INSUFFICIENT_STAKE (err u114))
+(define-constant ERR_NO_STAKE_FOUND (err u115))
+(define-constant ERR_STAKE_PERIOD_ACTIVE (err u116))
+(define-constant ERR_STAKE_ALREADY_EXISTS (err u117))
+(define-constant ERR_YIELD_NOT_READY (err u118))
 
 (define-constant INITIAL_TOKEN_SUPPLY u1000000000000)
 (define-constant MAX_DAILY_SCANS u10)
 (define-constant SCAN_COOLDOWN u144)
 (define-constant BLOCKS_PER_DAY u144)
+(define-constant MIN_STAKE_AMOUNT u1000)
+(define-constant STAKE_PERIOD_BLOCKS u1440)
+(define-constant YIELD_RATE_MULTIPLIER u100)
 
 ;; data vars
 (define-data-var next-qr-id uint u1)
@@ -129,6 +137,37 @@
   }
 )
 
+(define-map qr-stakes
+  { qr-id: uint, staker: principal }
+  {
+    stake-amount: uint,
+    stake-start-block: uint,
+    yield-earned: uint,
+    last-yield-claim: uint,
+    total-scans-when-staked: uint
+  }
+)
+
+(define-map qr-stake-pool
+  { qr-id: uint }
+  {
+    total-staked: uint,
+    total-stakers: uint,
+    total-yield-distributed: uint,
+    scans-since-last-distribution: uint
+  }
+)
+
+(define-map staker-portfolio
+  { staker: principal }
+  {
+    total-staked: uint,
+    total-yield-earned: uint,
+    active-stakes: uint,
+    best-performing-qr: uint
+  }
+)
+
 ;; public functions
 
 (define-public (create-qr-code (reward-amount uint) (max-scans uint) (duration-blocks uint) (location (string-ascii 100)) (category (string-ascii 50)))
@@ -218,6 +257,10 @@
     )
     
     (var-set total-scans (+ (var-get total-scans) u1))
+    
+    ;; Update stake pool with new scan
+    (update-stake-pool-on-scan qr-id)
+    
     (ok (get reward-amount qr-data))
   )
 )
@@ -462,6 +505,153 @@
   )
 )
 
+;; Staking functions
+(define-public (stake-on-qr (qr-id uint) (stake-amount uint))
+  (let
+    (
+      (qr-data (unwrap! (map-get? qr-codes { qr-id: qr-id }) ERR_QR_NOT_FOUND))
+      (existing-stake (map-get? qr-stakes { qr-id: qr-id, staker: tx-sender }))
+      (current-pool (default-to { total-staked: u0, total-stakers: u0, total-yield-distributed: u0, scans-since-last-distribution: u0 }
+                                 (map-get? qr-stake-pool { qr-id: qr-id })))
+      (user-portfolio (default-to { total-staked: u0, total-yield-earned: u0, active-stakes: u0, best-performing-qr: u0 }
+                                   (map-get? staker-portfolio { staker: tx-sender })))
+    )
+    (asserts! (>= stake-amount MIN_STAKE_AMOUNT) ERR_INSUFFICIENT_STAKE)
+    (asserts! (get active qr-data) ERR_QR_INACTIVE)
+    (asserts! (< stacks-block-height (get expiry-block qr-data)) ERR_QR_EXPIRED)
+    (asserts! (is-none existing-stake) ERR_STAKE_ALREADY_EXISTS)
+    
+    ;; Transfer tokens from user
+    (try! (ft-transfer? scanbit-token stake-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Create stake record
+    (map-set qr-stakes
+      { qr-id: qr-id, staker: tx-sender }
+      {
+        stake-amount: stake-amount,
+        stake-start-block: stacks-block-height,
+        yield-earned: u0,
+        last-yield-claim: stacks-block-height,
+        total-scans-when-staked: (get current-scans qr-data)
+      }
+    )
+    
+    ;; Update stake pool
+    (map-set qr-stake-pool
+      { qr-id: qr-id }
+      {
+        total-staked: (+ (get total-staked current-pool) stake-amount),
+        total-stakers: (+ (get total-stakers current-pool) u1),
+        total-yield-distributed: (get total-yield-distributed current-pool),
+        scans-since-last-distribution: (get scans-since-last-distribution current-pool)
+      }
+    )
+    
+    ;; Update user portfolio
+    (map-set staker-portfolio
+      { staker: tx-sender }
+      {
+        total-staked: (+ (get total-staked user-portfolio) stake-amount),
+        total-yield-earned: (get total-yield-earned user-portfolio),
+        active-stakes: (+ (get active-stakes user-portfolio) u1),
+        best-performing-qr: (get best-performing-qr user-portfolio)
+      }
+    )
+    
+    (ok stake-amount)
+  )
+)
+
+(define-public (unstake-from-qr (qr-id uint))
+  (let
+    (
+      (stake-data (unwrap! (map-get? qr-stakes { qr-id: qr-id, staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (current-pool (unwrap! (map-get? qr-stake-pool { qr-id: qr-id }) ERR_NO_STAKE_FOUND))
+      (user-portfolio (unwrap! (map-get? staker-portfolio { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+    )
+    (asserts! (>= stacks-block-height (+ (get stake-start-block stake-data) STAKE_PERIOD_BLOCKS)) ERR_STAKE_PERIOD_ACTIVE)
+    
+    ;; Calculate and claim any pending yield first
+    (let
+      (
+        (pending-yield (calculate-pending-yield qr-id tx-sender))
+      )
+      (if (> pending-yield u0)
+        (try! (as-contract (ft-mint? scanbit-token pending-yield tx-sender)))
+        true
+      )
+      
+      ;; Return staked amount
+      (try! (as-contract (ft-transfer? scanbit-token (get stake-amount stake-data) (as-contract tx-sender) tx-sender)))
+      
+      ;; Remove stake record
+      (map-delete qr-stakes { qr-id: qr-id, staker: tx-sender })
+      
+      ;; Update stake pool
+      (map-set qr-stake-pool
+        { qr-id: qr-id }
+        {
+          total-staked: (- (get total-staked current-pool) (get stake-amount stake-data)),
+          total-stakers: (- (get total-stakers current-pool) u1),
+          total-yield-distributed: (get total-yield-distributed current-pool),
+          scans-since-last-distribution: (get scans-since-last-distribution current-pool)
+        }
+      )
+      
+      ;; Update user portfolio
+      (map-set staker-portfolio
+        { staker: tx-sender }
+        {
+          total-staked: (- (get total-staked user-portfolio) (get stake-amount stake-data)),
+          total-yield-earned: (+ (get total-yield-earned user-portfolio) pending-yield),
+          active-stakes: (- (get active-stakes user-portfolio) u1),
+          best-performing-qr: (get best-performing-qr user-portfolio)
+        }
+      )
+      
+      (ok (+ (get stake-amount stake-data) pending-yield))
+    )
+  )
+)
+
+(define-public (claim-staking-yield (qr-id uint))
+  (let
+    (
+      (stake-data (unwrap! (map-get? qr-stakes { qr-id: qr-id, staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (pending-yield (calculate-pending-yield qr-id tx-sender))
+      (user-portfolio (unwrap! (map-get? staker-portfolio { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+    )
+    (asserts! (> pending-yield u0) ERR_YIELD_NOT_READY)
+    
+    ;; Mint yield tokens
+    (try! (as-contract (ft-mint? scanbit-token pending-yield tx-sender)))
+    
+    ;; Update stake record
+    (map-set qr-stakes
+      { qr-id: qr-id, staker: tx-sender }
+      (merge stake-data 
+        {
+          yield-earned: (+ (get yield-earned stake-data) pending-yield),
+          last-yield-claim: stacks-block-height
+        }
+      )
+    )
+    
+    ;; Update user portfolio
+    (map-set staker-portfolio
+      { staker: tx-sender }
+      (merge user-portfolio 
+        {
+          total-yield-earned: (+ (get total-yield-earned user-portfolio) pending-yield),
+          best-performing-qr: (if (> pending-yield u0) qr-id (get best-performing-qr user-portfolio))
+        }
+      )
+    )
+    
+    (ok pending-yield)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-qr-code (qr-id uint))
@@ -612,10 +802,100 @@
   )
 )
 
+(define-read-only (get-qr-stake (qr-id uint) (staker principal))
+  (map-get? qr-stakes { qr-id: qr-id, staker: staker })
+)
+
+(define-read-only (get-qr-stake-pool (qr-id uint))
+  (map-get? qr-stake-pool { qr-id: qr-id })
+)
+
+(define-read-only (get-staker-portfolio (staker principal))
+  (map-get? staker-portfolio { staker: staker })
+)
+
+(define-read-only (calculate-pending-yield (qr-id uint) (staker principal))
+  (let
+    (
+      (stake-data (map-get? qr-stakes { qr-id: qr-id, staker: staker }))
+      (qr-data (map-get? qr-codes { qr-id: qr-id }))
+      (pool-data (map-get? qr-stake-pool { qr-id: qr-id }))
+    )
+    (match stake-data
+      stake-info
+      (match qr-data
+        qr-info
+        (match pool-data
+          pool-info
+          (let
+            (
+              (scans-since-stake (- (get current-scans qr-info) (get total-scans-when-staked stake-info)))
+              (stake-share (if (> (get total-staked pool-info) u0)
+                            (/ (* (get stake-amount stake-info) u10000) (get total-staked pool-info))
+                            u0))
+              (yield-per-scan (/ (* (get reward-amount qr-info) YIELD_RATE_MULTIPLIER) u10000))
+              (total-yield (/ (* scans-since-stake yield-per-scan stake-share) u10000))
+            )
+            total-yield
+          )
+          u0
+        )
+        u0
+      )
+      u0
+    )
+  )
+)
+
+(define-read-only (get-staking-stats (qr-id uint))
+  (let
+    (
+      (qr-data (map-get? qr-codes { qr-id: qr-id }))
+      (pool-data (map-get? qr-stake-pool { qr-id: qr-id }))
+    )
+    (match qr-data
+      qr-info
+      (match pool-data
+        pool-info
+        {
+          exists: true,
+          total-staked: (get total-staked pool-info),
+          total-stakers: (get total-stakers pool-info),
+          current-scans: (get current-scans qr-info),
+          reward-amount: (get reward-amount qr-info),
+          apy-estimate: (if (> (get total-staked pool-info) u0)
+                         (/ (* (get reward-amount qr-info) YIELD_RATE_MULTIPLIER u365) (get total-staked pool-info))
+                         u0)
+        }
+        { exists: false, total-staked: u0, total-stakers: u0, current-scans: u0, reward-amount: u0, apy-estimate: u0 }
+      )
+      { exists: false, total-staked: u0, total-stakers: u0, current-scans: u0, reward-amount: u0, apy-estimate: u0 }
+    )
+  )
+)
+
 ;; private functions
+
+(define-private (update-stake-pool-on-scan (qr-id uint))
+  (let
+    (
+      (current-pool (map-get? qr-stake-pool { qr-id: qr-id }))
+    )
+    (match current-pool
+      pool-data
+      (map-set qr-stake-pool
+        { qr-id: qr-id }
+        (merge pool-data { scans-since-last-distribution: (+ (get scans-since-last-distribution pool-data) u1) })
+      )
+      true
+    )
+  )
+)
 
 ;; Initialize contract
 (begin
   (try! (ft-mint? scanbit-token INITIAL_TOKEN_SUPPLY CONTRACT_OWNER))
   (var-set contract-balance INITIAL_TOKEN_SUPPLY)
 )
+
+
