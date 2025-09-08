@@ -29,6 +29,10 @@
 (define-constant ERR_STAKE_PERIOD_ACTIVE (err u116))
 (define-constant ERR_STAKE_ALREADY_EXISTS (err u117))
 (define-constant ERR_YIELD_NOT_READY (err u118))
+(define-constant ERR_BOOST_NOT_FOUND (err u119))
+(define-constant ERR_BOOST_ALREADY_ACTIVE (err u120))
+(define-constant ERR_INVALID_BOOST_MULTIPLIER (err u121))
+(define-constant ERR_BOOST_EXPIRED (err u122))
 
 (define-constant INITIAL_TOKEN_SUPPLY u1000000000000)
 (define-constant MAX_DAILY_SCANS u10)
@@ -43,6 +47,7 @@
 (define-data-var total-scans uint u0)
 (define-data-var contract-balance uint u0)
 (define-data-var next-campaign-id uint u1)
+(define-data-var next-boost-index uint u0)
 
 ;; data maps
 (define-map qr-codes
@@ -168,6 +173,22 @@
   }
 )
 
+(define-map qr-boosts
+  { qr-id: uint }
+  {
+    boost-multiplier: uint,
+    boost-expiry: uint
+  }
+)
+
+(define-map boost-history
+  { qr-id: uint, boost-index: uint }
+  {
+    activated-at: uint,
+    multiplier: uint
+  }
+)
+
 ;; public functions
 
 (define-public (create-qr-code (reward-amount uint) (max-scans uint) (duration-blocks uint) (location (string-ascii 100)) (category (string-ascii 50)))
@@ -208,6 +229,8 @@
       (user-scan-data (map-get? user-scans { user: tx-sender, qr-id: qr-id }))
       (user-data (default-to { total-scans: u0, total-rewards: u0, last-scan-block: u0, reputation-score: u0 } 
                               (map-get? user-stats { user: tx-sender })))
+      (boost-multiplier (get-current-boost qr-id))
+      (final-reward (* (get reward-amount qr-data) boost-multiplier))
     )
     
     (asserts! (get active qr-data) ERR_QR_INACTIVE)
@@ -217,13 +240,13 @@
     (asserts! (< (get count daily-scans) MAX_DAILY_SCANS) ERR_DAILY_LIMIT_EXCEEDED)
     (asserts! (>= stacks-block-height (+ (get last-scan-block user-data) SCAN_COOLDOWN)) ERR_COOLDOWN_ACTIVE)
     
-    (try! (ft-mint? scanbit-token (get reward-amount qr-data) tx-sender))
+    (try! (ft-mint? scanbit-token final-reward tx-sender))
     
     (map-set user-scans
       { user: tx-sender, qr-id: qr-id }
       {
         scanned-at: stacks-block-height,
-        reward-earned: (get reward-amount qr-data)
+        reward-earned: final-reward
       }
     )
     
@@ -241,7 +264,7 @@
       { user: tx-sender }
       {
         total-scans: (+ (get total-scans user-data) u1),
-        total-rewards: (+ (get total-rewards user-data) (get reward-amount qr-data)),
+        total-rewards: (+ (get total-rewards user-data) final-reward),
         last-scan-block: stacks-block-height,
         reputation-score: (+ (get reputation-score user-data) u1)
       }
@@ -252,7 +275,7 @@
       {
         scanner: tx-sender,
         scanned-at: stacks-block-height,
-        reward-amount: (get reward-amount qr-data)
+        reward-amount: final-reward
       }
     )
     
@@ -261,7 +284,7 @@
     ;; Update stake pool with new scan
     (update-stake-pool-on-scan qr-id)
     
-    (ok (get reward-amount qr-data))
+    (ok final-reward)
   )
 )
 
@@ -652,6 +675,52 @@
   )
 )
 
+;; Boost system functions
+(define-public (activate-boost (qr-id uint) (multiplier uint) (duration uint))
+  (let (
+    (qr-data (unwrap! (map-get? qr-codes { qr-id: qr-id }) ERR_QR_NOT_FOUND))
+    (existing-boost (map-get? qr-boosts { qr-id: qr-id }))
+  )
+    (asserts! (is-eq (get creator qr-data) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-boost) ERR_BOOST_ALREADY_ACTIVE)
+    (asserts! (>= multiplier u1) ERR_INVALID_BOOST_MULTIPLIER)
+    (asserts! (> duration u0) ERR_INVALID_BOOST_MULTIPLIER)
+    
+    (map-set qr-boosts
+      { qr-id: qr-id }
+      {
+        boost-multiplier: multiplier,
+        boost-expiry: (+ stacks-block-height duration)
+      }
+    )
+    
+    ;; Record history
+    (let (
+      (history-index (var-get next-boost-index))
+    )
+      (map-set boost-history
+        { qr-id: qr-id, boost-index: history-index }
+        {
+          activated-at: stacks-block-height,
+          multiplier: multiplier
+        }
+      )
+      (var-set next-boost-index (+ history-index u1))
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-boost (qr-id uint))
+  (let (
+    (qr-boost (unwrap! (map-get? qr-boosts { qr-id: qr-id }) ERR_BOOST_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator (unwrap-panic (map-get? qr-codes { qr-id: qr-id })))) ERR_NOT_AUTHORIZED)
+    (map-delete qr-boosts { qr-id: qr-id })
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-qr-code (qr-id uint))
@@ -870,6 +939,37 @@
         { exists: false, total-staked: u0, total-stakers: u0, current-scans: u0, reward-amount: u0, apy-estimate: u0 }
       )
       { exists: false, total-staked: u0, total-stakers: u0, current-scans: u0, reward-amount: u0, apy-estimate: u0 }
+    )
+  )
+)
+
+;; Boost system read-only functions
+(define-read-only (get-boost-info (qr-id uint))
+  (let (
+    (boost (map-get? qr-boosts { qr-id: qr-id }))
+  )
+    (match boost
+      some-boost some-boost
+      { boost-multiplier: u1, boost-expiry: u0 }
+    )
+  )
+)
+
+(define-read-only (get-boost-history (qr-id uint) (index uint))
+  (map-get? boost-history { qr-id: qr-id, boost-index: index })
+)
+
+(define-read-only (get-current-boost (qr-id uint))
+  (let (
+    (boost (map-get? qr-boosts { qr-id: qr-id }))
+  )
+    (match boost
+      some-boost
+      (if (> (get boost-expiry some-boost) stacks-block-height)
+        (get boost-multiplier some-boost)
+        u1
+      )
+      u1
     )
   )
 )
